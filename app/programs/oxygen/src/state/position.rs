@@ -53,6 +53,7 @@ pub struct CollateralPosition {
     pub amount_scaled: u128,         // Scaled amount (for yield)
     pub is_collateral: bool,         // Used as collateral
     pub is_lending: bool,            // Used for lending to other users
+    pub deposit_timestamp: i64,      // When the position was created/modified
 }
 
 /// Borrow position
@@ -100,6 +101,7 @@ impl UserPosition {
                 amount_scaled: scaled_amount,
                 is_collateral: true,
                 is_lending: false,
+                deposit_timestamp: Clock::get()?.unix_timestamp,
             });
             return Ok(());
         }

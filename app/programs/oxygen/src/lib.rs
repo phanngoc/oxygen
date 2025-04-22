@@ -4,6 +4,7 @@ pub mod state;
 pub mod instructions;
 pub mod modules;
 pub mod errors;
+pub mod events;
 
 use instructions::*;
 use std::collections::HashMap;

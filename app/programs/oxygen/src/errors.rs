@@ -70,4 +70,53 @@ pub enum OxygenError {
     
     #[msg("Max leverage for market exceeded")]
     MaxLeverageExceeded,
+
+    // New error types for edge cases
+    #[msg("Operation temporarily paused")]
+    OperationPaused,
+    
+    #[msg("Pool utilization rate too high for this operation")]
+    UtilizationTooHigh,
+    
+    #[msg("Minimum lending duration not met")]
+    MinLendingDurationNotMet,
+    
+    #[msg("Lending not enabled for this pool")]
+    LendingNotEnabled,
+    
+    #[msg("Maximum lending capacity reached")]
+    MaxLendingCapacityReached,
+    
+    #[msg("Invalid oracle configuration")]
+    InvalidOracleConfig,
+    
+    #[msg("Stale oracle price data")]
+    StaleOracleData,
+    
+    #[msg("Lending position already exists")]
+    LendingPositionAlreadyExists,
+    
+    #[msg("Insufficient available balance for lending")]
+    InsufficientAvailableForLending,
+    
+    #[msg("Account not authorized for this operation")]
+    AccountNotAuthorized,
+    
+    #[msg("Rate limit exceeded")]
+    RateLimitExceeded,
+    
+    #[msg("Transaction size exceeds limits")]
+    TransactionSizeExceeded,
+    
+    #[msg("Invalid transaction sequence")]
+    InvalidTransactionSequence,
+    
+    #[msg("Insufficient reserves to cover operation")]
+    InsufficientReserves,
+    
+    #[msg("Protocol-wide debt ceiling reached")]
+    DebtCeilingReached,
+    
+    #[msg("Position recently modified, retry after cooldown")]
+    PositionModificationCooldown,
 }

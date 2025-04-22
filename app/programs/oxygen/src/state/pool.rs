@@ -18,6 +18,16 @@ pub struct Pool {
     pub flash_loan_fee: u64,             // Fee for flash loans
     pub host_fee_percentage: u8,         // Host fee percentage
     pub protocol_fee_percentage: u8,     // Protocol fee percentage
+    pub lending_enabled: bool,           // Whether lending is enabled
+    pub max_lending_ratio: u64,          // Maximum % of deposits for lending
+    pub min_lending_duration: u64,       // Minimum duration for lending
+    pub lending_fee: u64,                // Fee for lending (bps)
+    pub lending_interest_share: u64,     // % of interest to lenders
+    pub total_lent: u64,                 // Total amount being lent
+    pub operation_state_flags: u8,       // Flags for pausing operations
+    pub price_oracle: Pubkey,            // Oracle account for price feeds
+    pub last_oracle_price: u64,          // Last recorded oracle price
+    pub last_oracle_update: i64,         // Timestamp of last oracle update
     pub bump: u8,                        // PDA bump
 }
 
@@ -40,7 +50,17 @@ impl Pool {
         8 + // flash_loan_fee
         1 + // host_fee_percentage
         1 + // protocol_fee_percentage
-        1 // bump
+        1 + // lending_enabled
+        8 + // max_lending_ratio
+        8 + // min_lending_duration
+        8 + // lending_fee
+        8 + // lending_interest_share
+        8 + // total_lent
+         1 + // operation_state_flags
+        32 + // price_oracle
+        8 + // last_oracle_price
+        8 + // last_oracle_update
+        1   // bump
     }
 
     pub fn update_rates(&mut self, current_timestamp: i64) -> Result<()> {
@@ -154,5 +174,58 @@ impl Pool {
         }
         
         Ok(())
+    }
+
+    // Get the current borrow interest rate for the pool
+    pub fn get_borrow_rate(&self) -> Result<u64> {
+        let utilization_rate = self.get_utilization_rate();
+        
+        // Using the same interest model as in update_rates
+        let borrow_rate = if utilization_rate < self.optimal_utilization {
+            // Below optimal: lower rate
+            (utilization_rate as u128)
+                .checked_mul(10)
+                .unwrap_or(0)
+                .checked_div(100)
+                .unwrap_or(0) as u64
+        } else {
+            // Above optimal: increase rate more aggressively
+            let base_rate = (self.optimal_utilization as u128)
+                .checked_mul(10)
+                .unwrap_or(0)
+                .checked_div(100)
+                .unwrap_or(0) as u64;
+                
+            let excess_utilization = utilization_rate
+                .checked_sub(self.optimal_utilization)
+                .unwrap_or(0);
+                
+            let excess_rate = (excess_utilization as u128)
+                .checked_mul(20)
+                .unwrap_or(0)
+                .checked_div(100)
+                .unwrap_or(0) as u64;
+                
+            base_rate
+                .checked_add(excess_rate)
+                .ok_or(ErrorCode::MathOverflow)?
+        };
+        
+        Ok(borrow_rate)
+    }
+    
+    // Get the current lending interest rate for the pool
+    pub fn get_lending_rate(&self) -> Result<u64> {
+        // Lending rate is a percentage of the borrow rate
+        // determined by the lending_interest_share parameter
+        let borrow_rate = self.get_borrow_rate()?;
+        
+        let lending_rate = (borrow_rate as u128)
+            .checked_mul(self.lending_interest_share as u128)
+            .ok_or(ErrorCode::MathOverflow)?
+            .checked_div(10000)
+            .ok_or(ErrorCode::MathOverflow)? as u64;
+            
+        Ok(lending_rate)
     }
 }

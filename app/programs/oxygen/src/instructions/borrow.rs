@@ -3,6 +3,7 @@ use anchor_spl::token::{self, TokenAccount, Transfer};
 use std::collections::HashMap;
 use crate::state::{Pool, UserPosition};
 use crate::errors::OxygenError;
+use crate::events::{BorrowEvent, PoolUtilizationUpdatedEvent};
 
 #[derive(AnchorSerialize, AnchorDeserialize)]
 pub struct BorrowParams {
@@ -152,6 +153,27 @@ pub fn handler(ctx: Context<Borrow>, params: BorrowParams) -> Result<()> {
     // Recalculate health factor after the borrow
     let health_factor_after = user_position.calculate_health_factor(&pool_data)?;
     user_position.last_updated = clock.unix_timestamp;
+    
+    // Emit borrow event
+    emit!(BorrowEvent {
+        user: ctx.accounts.user.key(),
+        pool: pool.key(),
+        asset_mint: pool.asset_mint,
+        amount,
+        interest_rate: pool.get_borrow_rate()?,
+        timestamp: clock.unix_timestamp,
+    });
+    
+    // Emit pool utilization updated event since borrowing changes utilization
+    let utilization_rate = pool.get_utilization_rate();
+    emit!(PoolUtilizationUpdatedEvent {
+        pool: pool.key(),
+        asset_mint: pool.asset_mint,
+        utilization_rate,
+        borrow_interest_rate: pool.get_borrow_rate()?,
+        lending_interest_rate: pool.get_lending_rate()?,
+        timestamp: clock.unix_timestamp,
+    });
     
     msg!(
         "Borrowed {} tokens from pool. Health factor: {} -> {}",

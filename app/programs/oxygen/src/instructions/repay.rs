@@ -2,6 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, TokenAccount, Transfer};
 use crate::state::{Pool, UserPosition};
 use crate::errors::OxygenError;
+use crate::events::{RepayEvent, PoolUtilizationUpdatedEvent};
 
 #[derive(AnchorSerialize, AnchorDeserialize)]
 pub struct RepayParams {
@@ -120,7 +121,7 @@ pub fn handler(ctx: Context<Repay>, params: RepayParams) -> Result<()> {
     // Update health factor
     // This is technically not necessary for repayments as they only improve health,
     // but it's good to keep the position's data accurate
-    if !user_position.borrows.is_empty() {
+    if (!user_position.borrows.is_empty()) {
         // Mock price data for simplistic health calculation
         // In a real implementation, this would involve fetching oracle prices
         let mut pool_data = std::collections::HashMap::new();
@@ -135,6 +136,41 @@ pub fn handler(ctx: Context<Repay>, params: RepayParams) -> Result<()> {
         // No borrows, so perfectly healthy
         user_position.health_factor = u64::MAX;
     }
+    
+    // Calculate the interest portion of the payment
+    // Interest is the difference between the current value of the borrowed amount
+    // and the original borrowed amount (if we knew it)
+    // For simplicity, we'll estimate it based on the current utilization
+    let interest_rate = pool.get_borrow_rate()?;
+    let interest_portion = (repay_amount as u128)
+        .checked_mul(interest_rate as u128)
+        .ok_or(ErrorCode::MathOverflow)?
+        .checked_div(10000)
+        .ok_or(ErrorCode::MathOverflow)? as u64;
+    
+    let principal_portion = repay_amount.checked_sub(interest_portion).unwrap_or(repay_amount);
+    
+    // Emit repay event
+    emit!(RepayEvent {
+        user: ctx.accounts.user.key(),
+        pool: pool.key(), 
+        asset_mint: pool.asset_mint,
+        amount: repay_amount,
+        interest_paid: interest_portion,
+        principal_paid: principal_portion,
+        timestamp: clock.unix_timestamp,
+    });
+    
+    // Emit pool utilization updated event since repaying changes utilization
+    let utilization_rate = pool.get_utilization_rate();
+    emit!(PoolUtilizationUpdatedEvent {
+        pool: pool.key(),
+        asset_mint: pool.asset_mint, 
+        utilization_rate,
+        borrow_interest_rate: pool.get_borrow_rate()?,
+        lending_interest_rate: pool.get_lending_rate()?,
+        timestamp: clock.unix_timestamp,
+    });
     
     user_position.last_updated = clock.unix_timestamp;
     

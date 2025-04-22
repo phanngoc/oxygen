@@ -13,6 +13,11 @@ pub struct InitializePoolParams {
     pub flash_loan_fee: u64,         // Fee for flash loans (in basis points)
     pub host_fee_percentage: u8,     // Host fee percentage (0-100)
     pub protocol_fee_percentage: u8, // Protocol fee percentage (0-100)
+    pub lending_enabled: bool,       // Whether lending is enabled for this pool
+    pub max_lending_ratio: u64,      // Maximum % of deposits that can be used for lending (basis points)
+    pub min_lending_duration: u64,   // Minimum duration for lending positions in seconds
+    pub lending_fee: u64,            // Fee for lending out assets (in basis points)
+    pub lending_interest_share: u64, // Percentage of interest that goes to lenders (basis points)
 }
 
 #[derive(Accounts)]
@@ -68,6 +73,22 @@ pub fn handler(ctx: Context<InitializePool>, params: InitializePoolParams) -> Re
         params.host_fee_percentage + params.protocol_fee_percentage <= 100,
         OxygenError::InvalidParameter
     );
+
+    // Validate new lending parameters
+    require!(
+        params.max_lending_ratio <= 10000, // Cannot exceed 100%
+        OxygenError::InvalidParameter
+    );
+
+    require!(
+        params.lending_fee <= 1000, // Max 10% fee
+        OxygenError::InvalidParameter
+    );
+
+    require!(
+        params.lending_interest_share <= 10000, // Max 100%
+        OxygenError::InvalidParameter
+    );
     
     let pool = &mut ctx.accounts.pool;
     let clock = Clock::get()?;
@@ -77,7 +98,9 @@ pub fn handler(ctx: Context<InitializePool>, params: InitializePoolParams) -> Re
     pool.asset_reserve = ctx.accounts.asset_reserve.key();
     pool.total_deposits = 0;
     pool.total_borrows = 0;
-    pool.cumulative_borrow_rate = 0;
+    pool.available_lending_supply = 0;
+    pool.cumulative_borrow_rate = 1_000_000_000_000; // Initialize with 10^12 (1.0) for stable math
+    pool.cumulative_lending_rate = 1_000_000_000_000; // Initialize with 10^12 (1.0) for stable math
     pool.last_updated = clock.unix_timestamp;
     pool.optimal_utilization = params.optimal_utilization;
     pool.loan_to_value = params.loan_to_value;
@@ -87,9 +110,20 @@ pub fn handler(ctx: Context<InitializePool>, params: InitializePoolParams) -> Re
     pool.flash_loan_fee = params.flash_loan_fee;
     pool.host_fee_percentage = params.host_fee_percentage;
     pool.protocol_fee_percentage = params.protocol_fee_percentage;
+    
+    // Initialize new lending parameters
+    pool.lending_enabled = params.lending_enabled;
+    pool.max_lending_ratio = params.max_lending_ratio;
+    pool.min_lending_duration = params.min_lending_duration;
+    pool.lending_fee = params.lending_fee;
+    pool.lending_interest_share = params.lending_interest_share;
+    pool.total_lent = 0; // Initialize total amount being lent out
+    
     pool.bump = *ctx.bumps.get("pool").unwrap();
     
-    msg!("Initialized lending pool for {}", pool.asset_mint);
+    msg!("Initialized lending pool for {} with lending {}", 
+        pool.asset_mint, 
+        if params.lending_enabled { "enabled" } else { "disabled" });
     
     Ok(())
 }

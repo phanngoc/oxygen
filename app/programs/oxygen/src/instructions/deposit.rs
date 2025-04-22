@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use crate::state::{Pool, UserPosition};
 use crate::errors::OxygenError;
 use crate::modules::yield_generation::YieldModule;
+use crate::events::{DepositEvent, LendingEnabledEvent, PoolUtilizationUpdatedEvent};
 
 #[derive(AnchorSerialize, AnchorDeserialize)]
 pub struct DepositParams {
@@ -59,6 +60,33 @@ pub fn handler(ctx: Context<Deposit>, params: DepositParams) -> Result<()> {
     let user_position = &mut ctx.accounts.user_position;
     let clock = Clock::get()?;
     
+    // Check if operations are paused
+    if pool.operation_state_flags & 0x1 != 0 {
+        return Err(OxygenError::OperationPaused.into());
+    }
+    
+    // Check if lending is enabled on the pool when the user wants to enable lending
+    if params.enable_lending && !pool.lending_enabled {
+        return Err(OxygenError::LendingNotEnabled.into());
+    }
+    
+    // Check if there's a rate limit on position modifications
+    if clock.unix_timestamp - user_position.last_updated < 10 { // 10 second cooldown
+        return Err(OxygenError::PositionModificationCooldown.into());
+    }
+    
+    // Check if the user has enough token balance
+    let user_token_balance = ctx.accounts.user_token_account.amount;
+    if user_token_balance < amount {
+        return Err(OxygenError::InsufficientBalance.into());
+    }
+    
+    // Check transaction size limits
+    const MAX_DEPOSIT_SIZE: u64 = 1_000_000_000_000; // Example: 1 trillion token units
+    if amount > MAX_DEPOSIT_SIZE {
+        return Err(OxygenError::TransactionSizeExceeded.into());
+    }
+    
     // Update pool rates before any operations
     pool.update_rates(clock.unix_timestamp)?;
     
@@ -79,9 +107,29 @@ pub fn handler(ctx: Context<Deposit>, params: DepositParams) -> Result<()> {
         if collateral.pool == pool.key() {
             collateral.is_collateral = params.use_as_collateral;
             
-            // Set lending status in a separate field we'll add to the CollateralPosition struct
+            // Set lending status and timestamp
             collateral.is_lending = params.enable_lending;
+            collateral.deposit_timestamp = clock.unix_timestamp;
             break;
+        }
+    }
+    
+    // Check lending capacity when enabling lending
+    if params.enable_lending {
+        // Calculate how much is already being lent out
+        let total_after_deposit = pool.total_lent.checked_add(amount)
+            .ok_or(OxygenError::MathOverflow)?;
+            
+        // Calculate the maximum lending capacity based on the max_lending_ratio
+        let max_lending_capacity = (pool.total_deposits as u128)
+            .checked_mul(pool.max_lending_ratio as u128)
+            .ok_or(OxygenError::MathOverflow)?
+            .checked_div(10000)
+            .ok_or(OxygenError::MathOverflow)? as u64;
+            
+        // Ensure we don't exceed the maximum lending capacity
+        if total_after_deposit > max_lending_capacity {
+            return Err(OxygenError::MaxLendingCapacityReached.into());
         }
     }
     
@@ -102,24 +150,73 @@ pub fn handler(ctx: Context<Deposit>, params: DepositParams) -> Result<()> {
     // Update pool totals
     pool.total_deposits = pool.total_deposits
         .checked_add(amount)
-        .ok_or(ErrorCode::MathOverflow)?;
+        .ok_or(OxygenError::MathOverflow)?;
     
-    // If lending is enabled, update the lending supply
+    // If lending is enabled, update the lending supply and total_lent
     if params.enable_lending {
         pool.available_lending_supply = pool.available_lending_supply
             .checked_add(amount)
-            .ok_or(ErrorCode::MathOverflow)?;
+            .ok_or(OxygenError::MathOverflow)?;
+        
+        pool.total_lent = pool.total_lent
+            .checked_add(amount)
+            .ok_or(OxygenError::MathOverflow)?;
     }
     
     // Recalculate pool utilization rate after deposit
     pool.update_utilization_rate()?;
     
-    // Update health factor
+    // Update health factor using oracle prices if available
     let mut pool_data = HashMap::new();
-    pool_data.insert(pool.key(), (10000, pool.liquidation_threshold)); // Mock price data
+    
+    if pool.price_oracle != Pubkey::default() {
+        // Using oracle price for calculations
+        if (!verify_oracle_freshness(pool)) {
+            return Err(OxygenError::StaleOracleData.into());
+        }
+        
+        pool_data.insert(pool.key(), (pool.last_oracle_price, pool.liquidation_threshold));
+    } else {
+        // Fallback to default pricing
+        pool_data.insert(pool.key(), (10000, pool.liquidation_threshold));
+    }
+    
     let _ = user_position.calculate_health_factor(&pool_data)?;
     
     user_position.last_updated = clock.unix_timestamp;
+    
+    // Emit deposit event
+    emit!(DepositEvent {
+        user: ctx.accounts.user.key(),
+        pool: pool.key(),
+        asset_mint: pool.asset_mint,
+        amount,
+        is_collateral: params.use_as_collateral,
+        is_lending: params.enable_lending,
+        timestamp: clock.unix_timestamp,
+    });
+    
+    // If lending is enabled, also emit a lending enabled event
+    if params.enable_lending {
+        emit!(LendingEnabledEvent {
+            user: ctx.accounts.user.key(),
+            pool: pool.key(),
+            asset_mint: pool.asset_mint,
+            amount,
+            timestamp: clock.unix_timestamp,
+        });
+    }
+    
+    // Emit pool utilization updated event
+    let utilization_rate = pool.get_utilization_rate();
+    emit!(PoolUtilizationUpdatedEvent {
+        pool: pool.key(),
+        asset_mint: pool.asset_mint,
+        utilization_rate,
+        borrow_interest_rate: pool.get_borrow_rate()?,
+        lending_interest_rate: pool.get_lending_rate()?,
+        timestamp: clock.unix_timestamp,
+    });
     
     msg!(
         "Deposited {} tokens to pool (collateral: {}, lending: {})",
@@ -129,4 +226,17 @@ pub fn handler(ctx: Context<Deposit>, params: DepositParams) -> Result<()> {
     );
     
     Ok(())
+}
+
+// Helper function to verify oracle price freshness
+fn verify_oracle_freshness(pool: &Pool) -> bool {
+    if pool.price_oracle == Pubkey::default() {
+        return false;
+    }
+    
+    // Check if the oracle price update is within an acceptable time window
+    let max_oracle_staleness = 300; // 5 minutes in seconds
+    let clock = Clock::get().unwrap();
+    
+    clock.unix_timestamp - pool.last_oracle_update < max_oracle_staleness
 }

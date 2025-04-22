@@ -3,10 +3,12 @@ use anchor_spl::token::{self, TokenAccount, Transfer};
 use std::collections::HashMap;
 use crate::state::{Pool, UserPosition};
 use crate::errors::OxygenError;
+use crate::events::{WithdrawEvent, LendingDisabledEvent, PoolUtilizationUpdatedEvent};
 
 #[derive(AnchorSerialize, AnchorDeserialize)]
 pub struct WithdrawParams {
     pub amount: u64,  // Amount to withdraw
+    pub is_lending_withdrawal: bool, // Flag to indicate if this is a lending position withdrawal
 }
 
 #[derive(Accounts)]
@@ -55,17 +57,44 @@ pub fn handler(ctx: Context<Withdraw>, params: WithdrawParams) -> Result<()> {
     let user_position = &mut ctx.accounts.user_position;
     let clock = Clock::get()?;
     
+    // Check if operations are currently paused
+    if pool.operation_state_flags & 0x1 != 0 {
+        return Err(OxygenError::OperationPaused.into());
+    }
+    
+    // For lending withdrawals, verify lending is enabled for this pool
+    if params.is_lending_withdrawal && !pool.lending_enabled {
+        return Err(OxygenError::LendingNotEnabled.into());
+    }
+    
+    // Check for rate limiting - prevent frequent position modifications
+    if clock.unix_timestamp - user_position.last_updated < 10 { // 10 second cooldown
+        return Err(OxygenError::PositionModificationCooldown.into());
+    }
+    
     // Update pool rates
     pool.update_rates(clock.unix_timestamp)?;
     
     // Find the collateral position
     let mut found_index = None;
     let mut current_deposited_amount = 0;
+    let mut position_start_timestamp = 0;
     
     for (i, collateral) in user_position.collaterals.iter().enumerate() {
         if collateral.pool == pool.key() {
+            // For lending withdrawals, ensure the position is marked as lending
+            if params.is_lending_withdrawal && !collateral.is_lending {
+                continue;
+            }
+            
+            // For collateral withdrawals, ensure the position is marked as collateral
+            if !params.is_lending_withdrawal && !collateral.is_collateral {
+                continue;
+            }
+            
             found_index = Some(i);
             current_deposited_amount = collateral.amount_deposited;
+            position_start_timestamp = collateral.deposit_timestamp;
             break;
         }
     }
@@ -73,39 +102,72 @@ pub fn handler(ctx: Context<Withdraw>, params: WithdrawParams) -> Result<()> {
     require!(found_index.is_some(), OxygenError::CollateralNotFound);
     require!(current_deposited_amount >= amount, OxygenError::InsufficientBalance);
     
+    // Check for minimum lending duration if this is a lending withdrawal
+    if params.is_lending_withdrawal && 
+       pool.min_lending_duration > 0 &&
+       clock.unix_timestamp - position_start_timestamp < pool.min_lending_duration as i64 {
+        return Err(OxygenError::MinLendingDurationNotMet.into());
+    }
+    
     let collateral_index = found_index.unwrap();
     
     // Calculate how much collateral to remove (in scaled units)
     let collateral = &mut user_position.collaterals[collateral_index];
+    
+    // Guard against divide-by-zero
+    if collateral.amount_deposited == 0 {
+        return Err(OxygenError::MathOverflow.into());
+    }
+    
     let scaled_amount_to_remove = (amount as u128)
         .checked_mul(collateral.amount_scaled)
-        .ok_or(ErrorCode::MathOverflow)?
+        .ok_or(OxygenError::MathOverflow)?
         .checked_div(collateral.amount_deposited as u128)
-        .ok_or(ErrorCode::MathOverflow)?;
+        .ok_or(OxygenError::MathOverflow)?;
     
     // Update collateral values
     collateral.amount_deposited = collateral.amount_deposited
         .checked_sub(amount)
-        .ok_or(ErrorCode::MathOverflow)?;
+        .ok_or(OxygenError::MathOverflow)?;
     
     collateral.amount_scaled = collateral.amount_scaled
         .checked_sub(scaled_amount_to_remove)
-        .ok_or(ErrorCode::MathOverflow)?;
+        .ok_or(OxygenError::MathOverflow)?;
     
-    // Handle removal of the collateral entry if zero balance
-    if collateral.amount_deposited == 0 {
+    // If lending withdrawal, check if we need to update the is_lending flag
+    if params.is_lending_withdrawal && collateral.amount_deposited == 0 {
+        collateral.is_lending = false;
+    }
+    
+    // If collateral withdrawal, check if we need to update the is_collateral flag
+    if !params.is_lending_withdrawal && collateral.amount_deposited == 0 {
+        collateral.is_collateral = false;
+    }
+    
+    // Handle removal of the collateral entry if zero balance and neither lending nor collateral
+    if collateral.amount_deposited == 0 && !collateral.is_lending && !collateral.is_collateral {
         user_position.collaterals.remove(collateral_index);
     }
     
-    // If the position has any borrows, verify the withdrawal doesn't break health factor
-    if !user_position.borrows.is_empty() {
+    // If the position has any borrows and this is a collateral withdrawal, verify the withdrawal doesn't break health factor
+    if !params.is_lending_withdrawal && !user_position.borrows.is_empty() {
         // Create pool data map for health factor calculation
-        // In a real implementation, this would involve fetching oracle prices
         let mut pool_data = HashMap::new();
         
-        // Add the pool's liquidation threshold for calculation
-        // For simplicity, we're using a 1:1 price ratio
-        pool_data.insert(pool.key(), (10000, pool.liquidation_threshold));
+        // Check if we should use oracle prices
+        if pool.price_oracle != Pubkey::default() {
+            // In a real implementation, fetch the oracle price
+            // Here we're just using a placeholder implementation
+            if !verify_oracle_freshness(pool) {
+                return Err(OxygenError::StaleOracleData.into());
+            }
+            
+            // Add the pool with oracle price and liquidation threshold
+            pool_data.insert(pool.key(), (pool.last_oracle_price, pool.liquidation_threshold));
+        } else {
+            // Fallback to a 1:1 price ratio
+            pool_data.insert(pool.key(), (10000, pool.liquidation_threshold));
+        }
         
         // Calculate health factor with the updated collateral
         let health_factor = user_position.calculate_health_factor(&pool_data)?;
@@ -118,10 +180,45 @@ pub fn handler(ctx: Context<Withdraw>, params: WithdrawParams) -> Result<()> {
         );
     }
     
+    // If this is a lending withdrawal, perform additional checks
+    if params.is_lending_withdrawal {
+        // The available liquidity is the total deposits minus the total borrows
+        let available_liquidity = pool.total_deposits
+            .checked_sub(pool.total_borrows)
+            .ok_or(OxygenError::MathOverflow)?;
+            
+        require!(
+            available_liquidity >= amount,
+            OxygenError::InsufficientLiquidity
+        );
+        
+        // Check if there are enough reserves to cover the withdrawal
+        let reserve_balance = ctx.accounts.asset_reserve.amount;
+        if reserve_balance < amount {
+            return Err(OxygenError::InsufficientReserves.into());
+        }
+        
+        // Check if utilization is too high for withdrawal
+        let utilization = pool.get_utilization_rate();
+        const MAX_UTILIZATION_FOR_WITHDRAWAL: u64 = 9500; // 95%
+        
+        if utilization > MAX_UTILIZATION_FOR_WITHDRAWAL {
+            return Err(OxygenError::UtilizationTooHigh.into());
+        }
+    }
+    
     // Update pool totals
-    pool.total_deposits = pool.total_deposits
-        .checked_sub(amount)
-        .ok_or(ErrorCode::MathOverflow)?;
+    if params.is_lending_withdrawal {
+        // For lending withdrawals, update the lending pool metrics
+        pool.total_lent = pool.total_lent
+            .checked_sub(amount)
+            .ok_or(OxygenError::MathOverflow)?;
+    } else {
+        // For regular withdrawals
+        pool.total_deposits = pool.total_deposits
+            .checked_sub(amount)
+            .ok_or(OxygenError::MathOverflow)?;
+    }
     
     // Transfer tokens from reserve to user
     let pool_seeds = &[
@@ -148,7 +245,59 @@ pub fn handler(ctx: Context<Withdraw>, params: WithdrawParams) -> Result<()> {
     
     user_position.last_updated = clock.unix_timestamp;
     
-    msg!("Withdrawn {} tokens from pool", amount);
+    // Emit withdraw event with appropriate flags based on the withdrawal type
+    emit!(WithdrawEvent {
+        user: ctx.accounts.user.key(),
+        pool: pool.key(),
+        asset_mint: pool.asset_mint,
+        amount,
+        from_collateral: !params.is_lending_withdrawal,
+        from_lending: params.is_lending_withdrawal,
+        timestamp: clock.unix_timestamp,
+    });
+    
+    // If this is a lending withdrawal, also emit a lending disabled event
+    if params.is_lending_withdrawal {
+        emit!(LendingDisabledEvent {
+            user: ctx.accounts.user.key(),
+            pool: pool.key(),
+            asset_mint: pool.asset_mint,
+            amount,
+            timestamp: clock.unix_timestamp,
+        });
+    }
+    
+    // Emit pool utilization updated event
+    let utilization_rate = pool.get_utilization_rate();
+    emit!(PoolUtilizationUpdatedEvent {
+        pool: pool.key(),
+        asset_mint: pool.asset_mint,
+        utilization_rate,
+        borrow_interest_rate: pool.get_borrow_rate()?,
+        lending_interest_rate: pool.get_lending_rate()?,
+        timestamp: clock.unix_timestamp,
+    });
+    
+    // Emit event based on withdrawal type
+    if params.is_lending_withdrawal {
+        msg!("Withdrawn {} tokens from lending position", amount);
+    } else {
+        msg!("Withdrawn {} tokens from collateral position", amount);
+    }
     
     Ok(())
+}
+
+// Helper function to verify oracle price freshness
+fn verify_oracle_freshness(pool: &Pool) -> bool {
+    if pool.price_oracle == Pubkey::default() {
+        return false;
+    }
+    
+    // In a production implementation, this would check if the oracle
+    // price update is within an acceptable time window
+    let max_oracle_staleness = 300; // 5 minutes in seconds
+    let clock = Clock::get().unwrap();
+    
+    clock.unix_timestamp - pool.last_oracle_update < max_oracle_staleness
 }
