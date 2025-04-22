@@ -1,17 +1,20 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, TokenAccount, Transfer};
+use std::collections::HashMap;
 use crate::state::{Pool, UserPosition};
 use crate::errors::OxygenError;
+use crate::modules::yield_generation::YieldModule;
 
 #[derive(AnchorSerialize, AnchorDeserialize)]
 pub struct DepositParams {
-    pub amount: u64,             // Amount to deposit
-    pub use_as_collateral: bool, // Whether to use deposit as collateral
+    pub amount: u64,                  // Amount to deposit
+    pub use_as_collateral: bool,      // Whether to use as collateral
+    pub enable_lending: bool,         // Whether to enable lending to other users
 }
 
 #[derive(Accounts)]
 pub struct Deposit<'info> {
-    #[account(mut)]
+    #[account(mut)
     pub user: Signer<'info>,
     
     #[account(
@@ -37,16 +40,15 @@ pub struct Deposit<'info> {
     pub asset_reserve: Account<'info, TokenAccount>,
     
     #[account(
-        init_if_needed,
-        payer = user,
-        space = UserPosition::space(),
+        mut,
         seeds = [b"position", user.key().as_ref()],
-        bump,
+        bump = user_position.bump,
+        constraint = user_position.owner == user.key(),
     )]
     pub user_position: Account<'info, UserPosition>,
     
-    pub system_program: Program<'info, System>,
     pub token_program: Program<'info, anchor_spl::token::Token>,
+    pub clock: Sysvar<'info, Clock>,
 }
 
 pub fn handler(ctx: Context<Deposit>, params: DepositParams) -> Result<()> {
@@ -57,17 +59,30 @@ pub fn handler(ctx: Context<Deposit>, params: DepositParams) -> Result<()> {
     let user_position = &mut ctx.accounts.user_position;
     let clock = Clock::get()?;
     
-    // Update pool rates
+    // Update pool rates before any operations
     pool.update_rates(clock.unix_timestamp)?;
     
-    // First time initialization of user position if new
-    if user_position.owner == Pubkey::default() {
-        user_position.owner = ctx.accounts.user.key();
-        user_position.collaterals = Vec::new();
-        user_position.borrows = Vec::new();
-        user_position.health_factor = u64::MAX;
-        user_position.last_updated = clock.unix_timestamp;
-        user_position.bump = *ctx.bumps.get("user_position").unwrap();
+    // Calculate scaled amount based on the current exchange rate
+    // This accounts for accumulated yield in the pool
+    let scaled_amount = pool.deposit_to_scaled(amount)?;
+    
+    // Add deposit to user's collateral position
+    user_position.add_collateral(
+        pool.key(),
+        amount,
+        scaled_amount
+    )?;
+    
+    // Set the collateral usage flag for this deposit
+    // Find the collateral we just added/updated
+    for collateral in &mut user_position.collaterals {
+        if collateral.pool == pool.key() {
+            collateral.is_collateral = params.use_as_collateral;
+            
+            // Set lending status in a separate field we'll add to the CollateralPosition struct
+            collateral.is_lending = params.enable_lending;
+            break;
+        }
     }
     
     // Transfer tokens from user to pool reserve
@@ -84,33 +99,34 @@ pub fn handler(ctx: Context<Deposit>, params: DepositParams) -> Result<()> {
     
     token::transfer(cpi_context, amount)?;
     
-    // Calculate scaled amount (for yield accounting)
-    // If no deposits yet, start with 1:1 ratio
-    let scaled_amount = if pool.total_deposits == 0 {
-        amount as u128
-    } else {
-        (amount as u128)
-            .checked_mul(pool.total_deposits as u128)
-            .ok_or(ErrorCode::MathOverflow)?
-            .checked_div((pool.total_deposits) as u128)
-            .ok_or(ErrorCode::MathOverflow)?
-    };
-    
-    // Add collateral to user position
-    user_position.add_collateral(
-        pool.key(), 
-        amount, 
-        scaled_amount,
-    )?;
-    
     // Update pool totals
     pool.total_deposits = pool.total_deposits
         .checked_add(amount)
         .ok_or(ErrorCode::MathOverflow)?;
-        
+    
+    // If lending is enabled, update the lending supply
+    if params.enable_lending {
+        pool.available_lending_supply = pool.available_lending_supply
+            .checked_add(amount)
+            .ok_or(ErrorCode::MathOverflow)?;
+    }
+    
+    // Recalculate pool utilization rate after deposit
+    pool.update_utilization_rate()?;
+    
+    // Update health factor
+    let mut pool_data = HashMap::new();
+    pool_data.insert(pool.key(), (10000, pool.liquidation_threshold)); // Mock price data
+    let _ = user_position.calculate_health_factor(&pool_data)?;
+    
     user_position.last_updated = clock.unix_timestamp;
     
-    msg!("Deposited {} tokens into pool", amount);
+    msg!(
+        "Deposited {} tokens to pool (collateral: {}, lending: {})",
+        amount,
+        params.use_as_collateral,
+        params.enable_lending
+    );
     
     Ok(())
 }

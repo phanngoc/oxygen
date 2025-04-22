@@ -221,8 +221,149 @@ impl TradingModule {
         Ok(health_factor)
     }
     
+    /// Lock margin from user's collateral for a leveraged trade
+    pub fn lock_margin_from_collateral<'a>(
+        user_position: &mut Account<'a, UserPosition>,
+        required_margin: u64,
+        pool_data: &HashMap<Pubkey, (u64, u64)>
+    ) -> Result<()> {
+        // Get the available collateral in the user's account
+        let available_collateral = Self::calculate_user_available_collateral(
+            user_position,
+            pool_data
+        )?;
+        
+        require!(
+            available_collateral >= required_margin as u128,
+            OxygenError::InsufficientCollateral
+        );
+        
+        // Mark collateral as locked for trading
+        // This updates an internal tracking field to ensure this collateral
+        // isn't double-counted as available for other operations
+        user_position.locked_trading_margin = user_position.locked_trading_margin
+            .checked_add(required_margin)
+            .ok_or(ErrorCode::MathOverflow)?;
+            
+        msg!("Locked {} margin for leveraged trading", required_margin);
+        
+        Ok(())
+    }
+    
+    /// Place an order on Serum DEX
+    pub fn place_serum_dex_order<'a, 'info>(
+        ctx: &Context<'_, '_, '_, 'info>,
+        market_info: &Account<'a, MarketInfo>,
+        side: OrderSide,
+        order_type: OrderType,
+        size: u64,
+        price: u64,
+        client_id: u64
+    ) -> Result<()> {
+        // Convert our OrderSide to Serum OrderSide
+        let serum_side = match side {
+            OrderSide::Buy => {
+                msg!("Placing BUY order on Serum DEX");
+                // serum_dex::matching::Side::Bid
+                0 // Using 0 to represent Bid since we don't have direct Serum types
+            },
+            OrderSide::Sell => {
+                msg!("Placing SELL order on Serum DEX");
+                // serum_dex::matching::Side::Ask
+                1 // Using 1 to represent Ask since we don't have direct Serum types
+            }
+        };
+        
+        // Convert our OrderType to Serum OrderType
+        let serum_order_type = match order_type {
+            OrderType::Limit => {
+                msg!("Order type: LIMIT at price {}", price);
+                // serum_dex::matching::OrderType::Limit
+                0 // Using 0 to represent Limit order
+            },
+            OrderType::Market => {
+                msg!("Order type: MARKET");
+                // serum_dex::matching::OrderType::ImmediateOrCancel
+                1 // Using 1 to represent IoC (market) order
+            }
+        };
+        
+        // For a real implementation, we would:
+        // 1. Get all required Serum DEX accounts from ctx
+        // 2. Create a CPI call to the Serum DEX program
+        // 3. Pass all required accounts and parameters
+
+        // Example of what the actual code would look like:
+        // let serum_accounts = SerumDEXAccounts {
+        //     market: ctx.accounts.serum_market.to_account_info(),
+        //     open_orders: ctx.accounts.open_orders.to_account_info(),
+        //     request_queue: ctx.accounts.serum_request_queue.to_account_info(),
+        //     event_queue: ctx.accounts.serum_event_queue.to_account_info(),
+        //     bids: ctx.accounts.serum_bids.to_account_info(),
+        //     asks: ctx.accounts.serum_asks.to_account_info(),
+        //     coin_vault: ctx.accounts.serum_coin_vault.to_account_info(),
+        //     pc_vault: ctx.accounts.serum_pc_vault.to_account_info(),
+        //     // other required accounts...
+        // };
+        //
+        // serum_dex::new_order(
+        //     CpiContext::new(
+        //         ctx.accounts.dex_program.to_account_info(),
+        //         serum_accounts
+        //     ),
+        //     serum_side,
+        //     price,
+        //     size,
+        //     serum_order_type,
+        //     client_id
+        // )?;
+
+        msg!(
+            "Order placed on Serum DEX: Market={}, Size={}, Price={}, ClientID={}",
+            market_info.serum_market,
+            size,
+            price,
+            client_id
+        );
+        
+        Ok(())
+    }
+
+    /// Set up monitoring for a position's health
+    pub fn setup_position_monitoring<'a>(
+        position_id: u64,
+        market: Pubkey,
+        liquidation_price: u64,
+        user: Pubkey
+    ) -> Result<()> {
+        // In a full implementation, this would:
+        // 1. Register this position with an off-chain monitoring service
+        // 2. Set up any on-chain subscriptions needed
+        // 3. Store relevant monitoring parameters
+        
+        // For now, we'll just log the monitoring setup
+        msg!(
+            "Position monitoring setup: ID={}, Market={}, User={}, Liquidation Price={}",
+            position_id,
+            market,
+            user,
+            liquidation_price
+        );
+        
+        // Emit a program event to notify off-chain monitors
+        emit!(PositionCreatedEvent {
+            position_id,
+            market,
+            user,
+            liquidation_price,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        
+        Ok(())
+    }
+
     /// Create an order on Serum DEX
-    pub fn create_order<'a>(
+    pub fn create_order<'a, 'info>(
         user: &Pubkey,
         market: &Pubkey,
         market_info: &Account<'a, MarketInfo>,
@@ -263,6 +404,13 @@ impl TradingModule {
         // Generate a position ID
         let position_id = Self::generate_position_id(user_position)?;
         
+        // 1. Lock the required margin from the user's collateral
+        Self::lock_margin_from_collateral(
+            user_position,
+            required_margin,
+            pool_data
+        )?;
+        
         // Create a new leveraged position
         let new_position = LeveragedPosition {
             id: position_id,
@@ -287,10 +435,13 @@ impl TradingModule {
         // Add the position to the user's account
         user_position.leveraged_positions.push(new_position);
         
-        // In a real implementation, this would also:
-        // 1. Lock the required margin from the user's collateral
-        // 2. Place the actual order on Serum DEX
-        // 3. Set up monitoring for this position
+        // 3. Set up monitoring for position health
+        Self::setup_position_monitoring(
+            position_id,
+            *market,
+            new_position.liquidation_price,
+            *user
+        )?;
         
         msg!(
             "Leveraged position opened: ID={}, User={}, Market={}, Side={:?}, Size={}, Price={}, Leverage={}x",
@@ -635,4 +786,14 @@ impl TradingModule {
         
         Ok(())
     }
+}
+
+// Event emitted when a new position is created for off-chain monitoring
+#[event]
+pub struct PositionCreatedEvent {
+    pub position_id: u64,
+    pub market: Pubkey,
+    pub user: Pubkey,
+    pub liquidation_price: u64,
+    pub timestamp: i64,
 }

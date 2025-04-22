@@ -1,216 +1,217 @@
 use anchor_lang::prelude::*;
+use std::collections::HashMap;
 use crate::state::{Pool, UserPosition, CollateralPosition};
 use crate::errors::OxygenError;
 
-/// Module for managing yield generation and distribution
-pub struct YieldGenerator;
+/// Module for handling yield generation and distribution
+pub struct YieldModule;
 
-impl YieldGenerator {
-    /// Calculate accrued yield for a user's deposit in a specific pool
+impl YieldModule {
+    /// Calculate accrued yield for a user's lending position
     pub fn calculate_accrued_yield(
         pool: &Pool,
         collateral_position: &CollateralPosition,
+        current_timestamp: i64
     ) -> Result<u64> {
-        // If no deposits in pool, no yield
-        if pool.total_deposits == 0 {
+        // Skip if position isn't being used for lending
+        if !collateral_position.is_lending {
+            return Ok(0);
+        }
+
+        // No yield if no cumulative lending rate or just deposited
+        if pool.cumulative_lending_rate == 0 || pool.last_updated == 0 {
             return Ok(0);
         }
         
-        // Calculate current token equivalent of scaled amount
-        let current_token_value = (collateral_position.amount_scaled as u128)
-            .checked_mul(pool.total_deposits as u128)
-            .ok_or(ErrorCode::MathOverflow)?
-            .checked_div(10000) // Scale factor for precision
-            .ok_or(ErrorCode::MathOverflow)? as u64;
-            
-        // Calculate yield as the difference between current value and original deposit
-        let yield_amount = current_token_value
-            .checked_sub(collateral_position.amount_deposited)
-            .unwrap_or(0);
-            
-        Ok(yield_amount)
-    }
-    
-    /// Calculate APY for a specific pool
-    pub fn calculate_pool_apy(pool: &Pool) -> Result<u64> {
-        // If no deposits or no borrows, no yield
-        if pool.total_deposits == 0 || pool.total_borrows == 0 {
-            return Ok(0);
-        }
+        // Calculate the ratio of current lending rate to the rate when the deposit was made
+        // This gives us the growth factor of the deposit
+        let principal_value = collateral_position.amount_deposited;
         
-        // Calculate utilization rate
-        let utilization_rate = (pool.total_borrows as u128)
-            .checked_mul(10000) // Basis points
+        // Calculate accrued value using the ratio of scaled amount to current exchange rate
+        let current_value = (collateral_position.amount_scaled as u128)
+            .checked_mul(pool.cumulative_lending_rate)
             .ok_or(ErrorCode::MathOverflow)?
-            .checked_div(pool.total_deposits as u128)
+            .checked_div(1_000_000_000_000) // Scale back from 10^12 precision
             .ok_or(ErrorCode::MathOverflow)? as u64;
             
-        // Calculate borrow rate based on utilization (simplified model)
-        // In a real implementation, this would use a more sophisticated model
-        let borrow_rate = if utilization_rate <= pool.optimal_utilization {
-            // Below optimal utilization: linear increase
-            (utilization_rate as u128)
-                .checked_mul(500) // 0-5% range
-                .ok_or(ErrorCode::MathOverflow)?
-                .checked_div(pool.optimal_utilization as u128)
-                .ok_or(ErrorCode::MathOverflow)? as u64
+        // Accrued yield is the difference between current value and principal
+        let accrued_yield = if current_value > principal_value {
+            current_value.checked_sub(principal_value).unwrap_or(0)
         } else {
-            // Above optimal utilization: steeper increase
-            let base_rate = 500; // 5% at optimal utilization
-            
-            let excess_utilization = utilization_rate
-                .checked_sub(pool.optimal_utilization)
-                .ok_or(ErrorCode::MathOverflow)?;
-                
-            let max_excess = 10000u64
-                .checked_sub(pool.optimal_utilization)
-                .ok_or(ErrorCode::MathOverflow)?;
-                
-            let additional_rate = (excess_utilization as u128)
-                .checked_mul(1500) // Additional 0-15% for excess utilization
-                .ok_or(ErrorCode::MathOverflow)?
-                .checked_div(max_excess as u128)
-                .ok_or(ErrorCode::MathOverflow)? as u64;
-                
-            base_rate
-                .checked_add(additional_rate)
-                .ok_or(ErrorCode::MathOverflow)?
+            0 // Should never happen unless there's a numerical issue
         };
         
-        // Calculate supply APY based on borrow rate and utilization
-        let supply_apy = (borrow_rate as u128)
-            .checked_mul(utilization_rate as u128)
-            .ok_or(ErrorCode::MathOverflow)?
-            .checked_div(10000) // Adjust for basis points
-            .ok_or(ErrorCode::MathOverflow)? as u64;
-            
-        Ok(supply_apy)
+        Ok(accrued_yield)
     }
     
-    /// Calculate total yield earned across all pools for a user
-    pub fn calculate_total_yield_earned(
-        user_position: &UserPosition,
-        pools: &[(&Pubkey, &Pool)]
+    /// Claim accrued yield for a user's lending position
+    pub fn claim_yield<'a>(
+        pool: &mut Account<'a, Pool>,
+        user_position: &mut Account<'a, UserPosition>,
+        pool_key: &Pubkey,
+        current_timestamp: i64
     ) -> Result<u64> {
-        let mut total_yield = 0u64;
+        let mut total_accrued_yield = 0u64;
+        let mut collateral_index = None;
         
-        for collateral in &user_position.collaterals {
-            // Find corresponding pool for this collateral
-            for (pool_pubkey, pool) in pools {
-                if &collateral.pool == *pool_pubkey {
-                    let yield_amount = Self::calculate_accrued_yield(
-                        pool,
-                        collateral
-                    )?;
-                    
-                    total_yield = total_yield
-                        .checked_add(yield_amount)
-                        .ok_or(ErrorCode::MathOverflow)?;
-                        
-                    break;
-                }
+        // Find the collateral position for this pool
+        for (i, collateral) in user_position.collaterals.iter().enumerate() {
+            if collateral.pool == *pool_key && collateral.is_lending {
+                // Calculate accrued yield
+                let accrued_yield = Self::calculate_accrued_yield(
+                    pool,
+                    collateral,
+                    current_timestamp
+                )?;
+                
+                total_accrued_yield = accrued_yield;
+                collateral_index = Some(i);
+                break;
             }
         }
         
-        Ok(total_yield)
-    }
-    
-    /// Claim yield from a specific pool
-    pub fn claim_yield(
-        pool: &mut Pool,
-        collateral_position: &mut CollateralPosition,
-        reinvest: bool
-    ) -> Result<u64> {
-        // Calculate accrued yield
-        let yield_amount = Self::calculate_accrued_yield(pool, collateral_position)?;
-        
-        if yield_amount == 0 {
+        // Ensure we found the collateral position
+        if collateral_index.is_none() || total_accrued_yield == 0 {
+            // No yield to claim or position not found
             return Ok(0);
         }
         
-        if reinvest {
-            // If reinvesting, update deposit amount to include yield
-            collateral_position.amount_deposited = collateral_position.amount_deposited
-                .checked_add(yield_amount)
-                .ok_or(ErrorCode::MathOverflow)?;
-        } else {
-            // If not reinvesting, update deposit amount to match current value
-            let current_token_value = (collateral_position.amount_scaled as u128)
-                .checked_mul(pool.total_deposits as u128)
-                .ok_or(ErrorCode::MathOverflow)?
-                .checked_div(10000) // Scale factor
-                .ok_or(ErrorCode::MathOverflow)? as u64;
-                
-            collateral_position.amount_deposited = current_token_value;
-        }
+        // Verify the pool has enough liquidity to pay the yield
+        // This should never be a problem unless the protocol is insolvent
+        let available_liquidity = pool.total_deposits
+            .checked_sub(pool.total_borrows)
+            .ok_or(OxygenError::InsufficientLiquidity)?;
+            
+        require!(
+            available_liquidity >= total_accrued_yield,
+            OxygenError::InsufficientLiquidity
+        );
         
-        Ok(yield_amount)
+        // Update the collateral position to reflect claimed yield
+        let index = collateral_index.unwrap();
+        let collateral = &mut user_position.collaterals[index];
+        
+        // When claiming yield, we need to update the scaled amount to match the current rate
+        // This effectively resets the yield calculation
+        let new_scaled_amount = (collateral.amount_deposited as u128)
+            .checked_mul(1_000_000_000_000) // 10^12 precision
+            .ok_or(ErrorCode::MathOverflow)?
+            .checked_div(pool.cumulative_lending_rate)
+            .ok_or(ErrorCode::MathOverflow)?;
+            
+        collateral.amount_scaled = new_scaled_amount;
+        
+        // In a full implementation, we would now transfer the yield to the user
+        // For this MVP, we just track how much yield was claimed
+        
+        // Return the amount of yield claimed
+        Ok(total_accrued_yield)
     }
     
-    /// Update index when interest accrues to accurately track yield
-    pub fn update_index(
-        pool: &mut Pool,
+    /// Update lending yields for all deposits in a pool
+    pub fn update_pool_yields<'a>(
+        pool: &mut Account<'a, Pool>,
         current_timestamp: i64
     ) -> Result<()> {
-        // Skip if no time has passed or no deposits
-        if pool.last_updated == current_timestamp || pool.total_deposits == 0 {
+        if pool.last_updated == 0 || pool.last_updated == current_timestamp {
             return Ok(());
         }
         
-        // Calculate utilization rate
-        let utilization_rate = (pool.total_borrows as u128)
-            .checked_mul(10000)
-            .ok_or(ErrorCode::MathOverflow)?
-            .checked_div(pool.total_deposits as u128)
-            .unwrap_or(0) as u64;
-            
-        // Calculate borrow rate (simplified)
-        let borrow_rate = if utilization_rate <= pool.optimal_utilization {
-            (utilization_rate as u128)
-                .checked_mul(500)
-                .ok_or(ErrorCode::MathOverflow)?
-                .checked_div(pool.optimal_utilization as u128)
-                .ok_or(ErrorCode::MathOverflow)? as u64
+        // Calculate time elapsed since last update
+        let time_elapsed = (current_timestamp - pool.last_updated) as u128;
+        if time_elapsed == 0 {
+            return Ok(());
+        }
+        
+        // Calculate the lending APY based on pool utilization
+        let utilization_rate = if pool.available_lending_supply > 0 {
+            (pool.total_borrows as u128)
+                .checked_mul(10000)
+                .unwrap_or(0) / (pool.available_lending_supply as u128)
         } else {
-            let base_rate = 500;
-            
-            let excess_utilization = utilization_rate
-                .checked_sub(pool.optimal_utilization)
-                .ok_or(ErrorCode::MathOverflow)?;
-                
-            let max_excess = 10000u64
-                .checked_sub(pool.optimal_utilization)
-                .ok_or(ErrorCode::MathOverflow)?;
-                
-            let additional_rate = (excess_utilization as u128)
-                .checked_mul(1500)
-                .ok_or(ErrorCode::MathOverflow)?
-                .checked_div(max_excess as u128)
-                .ok_or(ErrorCode::MathOverflow)? as u64;
-                
-            base_rate
-                .checked_add(additional_rate)
-                .ok_or(ErrorCode::MathOverflow)?
+            0
         };
         
-        // Calculate time elapsed in seconds
-        let time_elapsed = (current_timestamp - pool.last_updated) as u128;
-        
-        // Calculate interest: rate * time / year
+        // Simple lending rate model
+        // Base yield is 80% of the borrow rate, scaled by utilization
+        let lending_rate = utilization_rate
+            .checked_mul(80)
+            .unwrap_or(0)
+            .checked_div(100)
+            .unwrap_or(0);
+            
+        // Update cumulative lending rate
+        // Formula: previous_rate + (lending_rate * time_elapsed / SECONDS_PER_YEAR)
         const SECONDS_PER_YEAR: u128 = 31536000; // 365 * 24 * 60 * 60
         
-        let interest_factor = (borrow_rate as u128)
+        let rate_increase = lending_rate
             .checked_mul(time_elapsed)
-            .ok_or(ErrorCode::MathOverflow)?
+            .unwrap_or(0)
             .checked_div(SECONDS_PER_YEAR)
-            .ok_or(ErrorCode::MathOverflow)?;
+            .unwrap_or(0);
             
-        // Update pool index for yield tracking
-        pool.cumulative_borrow_rate = pool.cumulative_borrow_rate
-            .checked_add(interest_factor)
-            .ok_or(ErrorCode::MathOverflow)?;
+        // Update pool's cumulative lending rate
+        // If this is the first update, initialize with 1 * 10^12 as base value
+        if pool.cumulative_lending_rate == 0 {
+            pool.cumulative_lending_rate = 1_000_000_000_000;
+        }
+        
+        pool.cumulative_lending_rate = pool.cumulative_lending_rate
+            .checked_add(rate_increase)
+            .unwrap_or(pool.cumulative_lending_rate);
             
+        // Update timestamp
         pool.last_updated = current_timestamp;
+        
+        Ok(())
+    }
+    
+    /// Check if a user has any lending positions enabled
+    pub fn has_lending_positions(
+        user_position: &UserPosition,
+    ) -> bool {
+        for collateral in &user_position.collaterals {
+            if collateral.is_lending {
+                return true;
+            }
+        }
+        false
+    }
+    
+    /// Check if a specific deposit is being used for lending
+    pub fn is_lending_enabled(
+        user_position: &UserPosition,
+        pool_key: &Pubkey
+    ) -> bool {
+        for collateral in &user_position.collaterals {
+            if &collateral.pool == pool_key && collateral.is_lending {
+                return true;
+            }
+        }
+        false
+    }
+    
+    /// Enable or disable lending for a specific deposit
+    pub fn set_lending_status<'a>(
+        user_position: &mut Account<'a, UserPosition>,
+        pool_key: &Pubkey,
+        enable_lending: bool,
+        pool_data: &HashMap<Pubkey, (u64, u64)>
+    ) -> Result<()> {
+        let mut found = false;
+        
+        for collateral in &mut user_position.collaterals {
+            if collateral.pool == *pool_key {
+                collateral.is_lending = enable_lending;
+                found = true;
+                break;
+            }
+        }
+        
+        require!(found, OxygenError::CollateralNotFound);
+        
+        // Recalculate health factor after change in case this affects borrowing capacity
+        let _ = user_position.calculate_health_factor(pool_data)?;
         
         Ok(())
     }

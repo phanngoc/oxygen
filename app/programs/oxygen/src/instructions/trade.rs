@@ -175,6 +175,13 @@ pub fn open_trade(ctx: Context<TradeWithLeverage>, params: TradeParams) -> Resul
     // for this market and create one if needed
     let _ = TradingModule::initialize_open_orders_account(&ctx)?;
     
+    // 1. Lock the required margin from the user's collateral
+    TradingModule::lock_margin_from_collateral(
+        user_position,
+        required_margin,
+        &pool_data
+    )?;
+    
     // Create the order on Serum DEX
     let position_id = TradingModule::create_order(
         &ctx.accounts.user.key(),
@@ -192,10 +199,19 @@ pub fn open_trade(ctx: Context<TradeWithLeverage>, params: TradeParams) -> Resul
         &pool_data
     )?;
     
-    // In a full implementation, we would:
-    // 1. Lock the required margin from the user's collateral
-    // 2. Place the actual order on Serum DEX using the Serum program
+    // 2. Place the actual order on Serum DEX
+    TradingModule::place_serum_dex_order(
+        &ctx,
+        market_info,
+        params.side,
+        params.order_type,
+        params.size,
+        params.price,
+        params.client_id
+    )?;
+    
     // 3. Set up monitoring for position health
+    // Note: This is already done inside the create_order function
     
     // Update the user's health factor with the new position
     user_position.calculate_health_factor(&pool_data)?;

@@ -2,10 +2,11 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, TokenAccount, Transfer};
 use crate::state::{Pool, UserPosition};
 use crate::errors::OxygenError;
+use crate::modules::yield_generation::YieldModule;
 
 #[derive(AnchorSerialize, AnchorDeserialize)]
 pub struct ClaimYieldParams {
-    pub reinvest: bool,  // Whether to reinvest yield back into the pool
+    pub reinvest: bool,        // Whether to reinvest yield back into the pool
 }
 
 #[derive(Accounts)]
@@ -51,92 +52,93 @@ pub fn handler(ctx: Context<ClaimYield>, params: ClaimYieldParams) -> Result<()>
     let user_position = &mut ctx.accounts.user_position;
     let clock = Clock::get()?;
     
-    // Update pool rates to ensure all yield has been accrued
+    // Update pool rates and yields before claiming
     pool.update_rates(clock.unix_timestamp)?;
     
-    // Find user's collateral in the specified pool
-    let mut collateral_position_idx = None;
-    for (i, collateral) in user_position.collaterals.iter().enumerate() {
-        if collateral.pool == pool.key() {
-            collateral_position_idx = Some(i);
+    // Check if the user has any lending position in this pool
+    let mut has_lending_position = false;
+    for collateral in &user_position.collaterals {
+        if collateral.pool == pool.key() && collateral.is_lending {
+            has_lending_position = true;
             break;
         }
     }
     
-    let collateral_position_idx = collateral_position_idx.ok_or(OxygenError::InvalidParameter)?;
-    let collateral_position = &mut user_position.collaterals[collateral_position_idx];
+    require!(has_lending_position, OxygenError::CollateralNotFound);
     
-    // Calculate accrued yield by comparing scaled amount to current value
-    // In a lending pool, the exchange rate between scaled units and tokens increases over time
-    // as interest accrues
+    // Calculate accrued yield
+    let accrued_yield = YieldModule::claim_yield(
+        pool,
+        user_position,
+        &pool.key(),
+        clock.unix_timestamp
+    )?;
     
-    // Calculate the current token amount based on scaled amount
-    let current_token_value = if pool.total_deposits == 0 {
-        collateral_position.amount_scaled as u64
-    } else {
-        ((collateral_position.amount_scaled as u128)
-            .checked_mul(pool.total_deposits as u128)
-            .ok_or(ErrorCode::MathOverflow)?
-            .checked_div(10000) // Assuming a scale factor for precision
-            .ok_or(ErrorCode::MathOverflow)?) as u64
-    };
+    require!(accrued_yield > 0, OxygenError::InvalidParameter);
     
-    let yield_amount = current_token_value
-        .checked_sub(collateral_position.amount_deposited)
-        .unwrap_or(0);
-        
-    require!(yield_amount > 0, OxygenError::InvalidParameter);
-    
-    // Transfer yield tokens from reserve to user
-    let pool_seeds = &[
-        b"pool".as_ref(),
-        pool.asset_mint.as_ref(),
-        &[pool.bump],
-    ];
-    
-    let pool_signer = &[&pool_seeds[..]];
-    
-    let cpi_accounts = Transfer {
-        from: ctx.accounts.asset_reserve.to_account_info(),
-        to: ctx.accounts.user_token_account.to_account_info(),
-        authority: ctx.accounts.pool.to_account_info(),
-    };
-    
-    let cpi_context = CpiContext::new_with_signer(
-        ctx.accounts.token_program.to_account_info(),
-        cpi_accounts,
-        pool_signer,
-    );
-    
-    token::transfer(cpi_context, yield_amount)?;
-    
+    // Check if reinvestment is requested
     if params.reinvest {
-        // If reinvesting, add the yield amount back to collateral
-        collateral_position.amount_deposited = collateral_position.amount_deposited
-            .checked_add(yield_amount)
-            .ok_or(ErrorCode::MathOverflow)?;
-            
-        // Update scaled amount as well
-        // In practice this would involve a more complex calculation based on current exchange rate
-        let additional_scaled_amount = (yield_amount as u128)
-            .checked_mul(10000) // Assuming a scale factor for precision
-            .ok_or(ErrorCode::MathOverflow)?
-            .checked_div(pool.total_deposits as u128)
-            .ok_or(ErrorCode::MathOverflow)?;
-            
-        collateral_position.amount_scaled = collateral_position.amount_scaled
-            .checked_add(additional_scaled_amount)
-            .ok_or(ErrorCode::MathOverflow)?;
-            
-        msg!("Claimed and reinvested {} yield tokens", yield_amount);
-    } else {
-        // If not reinvesting, adjust the user's position to reflect claimed yield
-        collateral_position.amount_deposited = current_token_value;
+        // If reinvesting, add to the user's collateral position
+        for collateral in &mut user_position.collaterals {
+            if collateral.pool == pool.key() && collateral.is_lending {
+                // Add yield to the deposit
+                collateral.amount_deposited = collateral.amount_deposited
+                    .checked_add(accrued_yield)
+                    .ok_or(ErrorCode::MathOverflow)?;
+                
+                // Update scaled amount to reflect the new deposit
+                let additional_scaled = pool.deposit_to_scaled(accrued_yield)?;
+                collateral.amount_scaled = collateral.amount_scaled
+                    .checked_add(additional_scaled)
+                    .ok_or(ErrorCode::MathOverflow)?;
+                
+                break;
+            }
+        }
         
-        msg!("Claimed {} yield tokens", yield_amount);
+        // Update pool totals to reflect the reinvestment
+        pool.total_deposits = pool.total_deposits
+            .checked_add(accrued_yield)
+            .ok_or(ErrorCode::MathOverflow)?;
+            
+        if params.reinvest {
+            // If reinvesting, also update the available lending supply
+            pool.available_lending_supply = pool.available_lending_supply
+                .checked_add(accrued_yield)
+                .ok_or(ErrorCode::MathOverflow)?;
+        }
+        
+        pool.update_utilization_rate()?;
+        
+        msg!("Reinvested yield of {} tokens", accrued_yield);
+    } else {
+        // If not reinvesting, transfer tokens to the user
+        let pool_seeds = &[
+            b"pool".as_ref(),
+            pool.asset_mint.as_ref(),
+            &[pool.bump],
+        ];
+        
+        let pool_signer = &[&pool_seeds[..]];
+        
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.asset_reserve.to_account_info(),
+            to: ctx.accounts.user_token_account.to_account_info(),
+            authority: ctx.accounts.pool.to_account_info(),
+        };
+        
+        let cpi_context = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+            pool_signer,
+        );
+        
+        token::transfer(cpi_context, accrued_yield)?;
+        
+        msg!("Claimed yield of {} tokens", accrued_yield);
     }
     
-    // Update last updated timestamp
+    // Update user position's last updated timestamp
     user_position.last_updated = clock.unix_timestamp;
     
     Ok(())

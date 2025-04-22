@@ -6,7 +6,9 @@ pub struct Pool {
     pub asset_reserve: Pubkey,           // Pool's token account
     pub total_deposits: u64,             // Total deposits in the pool
     pub total_borrows: u64,              // Total borrows from the pool
+    pub available_lending_supply: u64,   // Amount available to be lent out
     pub cumulative_borrow_rate: u128,    // Accumulated borrow rate
+    pub cumulative_lending_rate: u128,   // Accumulated lending rate
     pub last_updated: i64,               // Last update timestamp
     pub optimal_utilization: u64,        // Target utilization rate
     pub loan_to_value: u64,              // Max LTV ratio for this asset
@@ -26,7 +28,9 @@ impl Pool {
         32 + // asset_reserve
         8 + // total_deposits
         8 + // total_borrows
+        8 + // available_lending_supply
         16 + // cumulative_borrow_rate
+        16 + // cumulative_lending_rate
         8 + // last_updated
         8 + // optimal_utilization
         8 + // loan_to_value
@@ -90,5 +94,65 @@ impl Pool {
         }
         
         ((self.total_borrows as u128).checked_mul(10000).unwrap_or(0) / (self.total_deposits as u128)) as u64
+    }
+
+    pub fn deposit_to_scaled(&self, amount: u64) -> Result<u128> {
+        // Convert deposit amount to scaled amount based on the current exchange rate
+        if self.total_deposits == 0 {
+            // First deposit, 1:1 ratio
+            return Ok(amount as u128);
+        }
+        
+        // Scale by cumulative lending rate
+        // scaled_amount = amount * 10^12 / cumulative_lending_rate
+        let scaled_amount = (amount as u128)
+            .checked_mul(1_000_000_000_000) // 10^12 precision
+            .ok_or(ErrorCode::MathOverflow)?
+            .checked_div(self.cumulative_lending_rate)
+            .ok_or(ErrorCode::MathOverflow)?;
+            
+        Ok(scaled_amount)
+    }
+    
+    pub fn update_utilization_rate(&mut self) -> Result<()> {
+        // Calculate the current utilization rate of the pool
+        if self.total_deposits == 0 {
+            // No deposits, zero utilization
+            return Ok(());
+        }
+        
+        // Also update available for lending based on lending flags
+        // This function should be called after deposit/withdraw/borrow/repay operations
+        let lending_utilization = if self.available_lending_supply > 0 {
+            (self.total_borrows as u128)
+                .checked_mul(10000)
+                .unwrap_or(0) / (self.available_lending_supply as u128)
+        } else {
+            0
+        };
+        
+        // Update lending rate based on lending utilization
+        // This determines the yield distributed to lenders
+        if self.last_updated > 0 {
+            let utilization_factor = std::cmp::min(lending_utilization as u64, 10000);
+            let base_lending_rate = (utilization_factor as u128)
+                .checked_mul(8) // 80% of borrow rate goes to lenders
+                .unwrap_or(0)
+                .checked_div(10)
+                .unwrap_or(0);
+                
+            // Update cumulative lending rate
+            const SECONDS_PER_YEAR: u128 = 31536000; // 365 * 24 * 60 * 60
+            let time_elapsed = (Clock::get().unwrap().unix_timestamp - self.last_updated) as u128;
+            
+            let rate_increase = base_lending_rate
+                .checked_mul(time_elapsed).unwrap_or(0)
+                .checked_div(SECONDS_PER_YEAR).unwrap_or(0);
+                
+            self.cumulative_lending_rate = self.cumulative_lending_rate
+                .checked_add(rate_increase).unwrap_or(self.cumulative_lending_rate);
+        }
+        
+        Ok(())
     }
 }

@@ -52,6 +52,7 @@ pub struct CollateralPosition {
     pub amount_deposited: u64,       // Deposited amount
     pub amount_scaled: u128,         // Scaled amount (for yield)
     pub is_collateral: bool,         // Used as collateral
+    pub is_lending: bool,            // Used for lending to other users
 }
 
 /// Borrow position
@@ -98,6 +99,7 @@ impl UserPosition {
                 amount_deposited: amount,
                 amount_scaled: scaled_amount,
                 is_collateral: true,
+                is_lending: false,
             });
             return Ok(());
         }
