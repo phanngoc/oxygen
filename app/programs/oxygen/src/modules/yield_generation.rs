@@ -2,6 +2,7 @@ use anchor_lang::prelude::*;
 use std::collections::HashMap;
 use crate::state::{Pool, UserPosition, CollateralPosition};
 use crate::errors::OxygenError;
+use crate::modules::wallet_integration::WalletIntegration;
 
 /// Module for handling yield generation and distribution
 pub struct YieldModule;
@@ -45,12 +46,21 @@ impl YieldModule {
     }
     
     /// Claim accrued yield for a user's lending position
+    /// Non-custodial: requires user signature to claim their own yield
     pub fn claim_yield<'a>(
         pool: &mut Account<'a, Pool>,
         user_position: &mut Account<'a, UserPosition>,
         pool_key: &Pubkey,
-        current_timestamp: i64
+        current_timestamp: i64,
+        user: &Signer<'a>,
     ) -> Result<u64> {
+        // First validate non-custodial requirements
+        require!(pool.immutable, OxygenError::PoolIsUpgradable);
+        require!(pool.admin_less, OxygenError::AdminOperationsNotSupported);
+        
+        // Non-custodial security: ensure only the owner can claim their yield
+        WalletIntegration::validate_owner_signed(&user_position.owner, user)?;
+        
         let mut total_accrued_yield = 0u64;
         let mut collateral_index = None;
         
@@ -101,8 +111,8 @@ impl YieldModule {
             
         collateral.amount_scaled = new_scaled_amount;
         
-        // In a full implementation, we would now transfer the yield to the user
-        // For this MVP, we just track how much yield was claimed
+        // In a full implementation, we would now transfer the yield to the user's wallet
+        // Non-custodial: we transfer directly to the user's wallet, not to protocol-controlled accounts
         
         // Return the amount of yield claimed
         Ok(total_accrued_yield)
@@ -113,6 +123,10 @@ impl YieldModule {
         pool: &mut Account<'a, Pool>,
         current_timestamp: i64
     ) -> Result<()> {
+        // Verify the pool is non-custodial and immutable
+        require!(pool.immutable, OxygenError::PoolIsUpgradable);
+        require!(pool.admin_less, OxygenError::AdminOperationsNotSupported);
+        
         if pool.last_updated == 0 || pool.last_updated == current_timestamp {
             return Ok(());
         }

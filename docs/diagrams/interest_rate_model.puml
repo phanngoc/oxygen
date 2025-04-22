@@ -1,0 +1,95 @@
+@startuml Interest Rate Model
+
+' Define styling
+skinparam backgroundColor white
+skinparam defaultFontName Arial
+skinparam defaultFontSize 12
+skinparam sequenceTitleFontSize 16
+
+' Title
+title Oxygen Protocol - Interest Rate Model
+
+' Set up the canvas
+scale 1.2
+
+' Define variables for better positioning
+!$width = 800
+!$height = 500
+!$origin_x = 20
+!$origin_y = 450
+!$max_x = $origin_x + $width
+!$max_y = $origin_y - $height
+
+' Draw the axis
+line $origin_x,$origin_y -> $max_x,$origin_y  #000000 : Utilization Rate (%) >
+line $origin_x,$origin_y -> $origin_x,$max_y  #000000 : Interest Rate (%) ^
+
+' Draw tick marks and labels for X axis
+!$tick_count = 10
+!$tick_step = $width / $tick_count
+!$tick_value_step = 100 / $tick_count
+
+!$x = $origin_x
+!$value = 0
+!while $value <= 100
+  line $x,$origin_y -> $x,$origin_y+5 #000000
+  text "$value%" at $x,$origin_y+20 center
+  !$x = $x + $tick_step
+  !$value = $value + $tick_value_step
+!endwhile
+
+' Draw tick marks and labels for Y axis
+!$tick_count = 10
+!$tick_step = $height / $tick_count
+!$tick_value_step = 50 / $tick_count
+
+!$y = $origin_y
+!$value = 0
+!while $value <= 50
+  line $origin_x,$y -> $origin_x-5,$y #000000
+  text "$value%" at $origin_x-20,$y center
+  !$y = $y - $tick_step
+  !$value = $value + $tick_value_step
+!endwhile
+
+' Define the optimal utilization point
+!$optimal_util = 80
+!$optimal_x = $origin_x + ($optimal_util * $width / 100)
+line $optimal_x,$origin_y -> $optimal_x,$origin_y-$height #DDDDDD
+
+' Label for optimal utilization
+text "Optimal Utilization" at $optimal_x,$origin_y+40 center
+
+' Draw the interest rate curve
+' The curve has different slopes before and after the optimal utilization
+' First segment: from 0% to optimal utilization
+!$y_at_optimal = $origin_y - ($height * 0.1)
+path "interest_low" $origin_x,$origin_y $optimal_x,$y_at_optimal #3498db;4
+' Second segment: from optimal utilization to 100% (steeper slope)
+path "interest_high" $optimal_x,$y_at_optimal $max_x,$origin_y-$height #e74c3c;4
+
+' Draw the lending rate curve (slightly lower than the borrow rate)
+!$lending_gap = $height * 0.2
+path "lending_low" $origin_x,$origin_y $optimal_x,$y_at_optimal-$lending_gap #2ecc71;4
+path "lending_high" $optimal_x,$y_at_optimal-$lending_gap $max_x,$origin_y-$height-$lending_gap #2ecc71;4
+
+' Add markers for the different rate zones
+rectangle "Low Utilization\nLower Interest Rates" $origin_x+10,$origin_y-30 $optimal_x-10,$origin_y-80 #EBF5FB #3498db
+rectangle "Optimal Utilization\nBalanced Rates" $optimal_x-70,$y_at_optimal+30 $optimal_x+70,$y_at_optimal-30 #EAFAF1 #2ecc71
+rectangle "High Utilization\nHigher Interest Rates" $optimal_x+10,$origin_y-$height+50 $max_x-10,$origin_y-$height+100 #FDEDEC #e74c3c
+
+' Add legend
+rectangle "Legend" $origin_x+50,$max_y+50 $origin_x+200,$max_y+120 #FFFFFF #000000
+line $origin_x+70,$max_y+70 -> $origin_x+120,$max_y+70 #3498db;4
+text "Borrowing Rate" at $origin_x+160,$max_y+70 left
+line $origin_x+70,$max_y+100 -> $origin_x+120,$max_y+100 #2ecc71;4
+text "Lending Rate" at $origin_x+160,$max_y+100 left
+
+' Add additional information about the interest rate model
+text "Interest Rate Model Properties:" at $max_x-250,$max_y+30 left
+text "• Base Rate = 0-1% (minimum rate)" at $max_x-250,$max_y+50 left
+text "• Slope 1 = 10% (standard slope)" at $max_x-250,$max_y+70 left
+text "• Slope 2 = 100% (steep slope)" at $max_x-250,$max_y+90 left
+text "• Lending Share = 80% of borrowing rate" at $max_x-250,$max_y+110 left
+
+@enduml

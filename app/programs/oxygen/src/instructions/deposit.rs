@@ -60,10 +60,26 @@ pub fn handler(ctx: Context<Deposit>, params: DepositParams) -> Result<()> {
     let user_position = &mut ctx.accounts.user_position;
     let clock = Clock::get()?;
     
-    // Check if operations are paused
+    // Ensure the pool is non-custodial and immutable
+    require!(pool.immutable, OxygenError::PoolIsUpgradable);
+    require!(pool.admin_less, OxygenError::AdminOperationsNotSupported);
+    
+    // Verify that operations are not paused - should never be possible in admin_less mode
     if pool.operation_state_flags & 0x1 != 0 {
         return Err(OxygenError::OperationPaused.into());
     }
+    
+    // Strictly enforce user signature - only users can move their funds
+    require!(
+        ctx.accounts.user.is_signer,
+        OxygenError::UserSignatureRequired
+    );
+    
+    // Ensure position belongs to the current user
+    require!(
+        user_position.owner == ctx.accounts.user.key(),
+        OxygenError::OnlyPositionOwnerAllowed
+    );
     
     // Check if lending is enabled on the pool when the user wants to enable lending
     if params.enable_lending && !pool.lending_enabled {

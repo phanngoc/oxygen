@@ -119,4 +119,26 @@ pub enum OxygenError {
     
     #[msg("Position recently modified, retry after cooldown")]
     PositionModificationCooldown,
+    
+    // New error types for non-custodial architecture
+    #[msg("Pools must be set as immutable for security")]
+    PoolMustBeImmutable,
+    
+    #[msg("Pools must be set as admin-less for security")]
+    PoolMustBeAdminLess,
+    
+    #[msg("Pool is upgradeable, which is not allowed")]
+    PoolIsUpgradable,
+    
+    #[msg("Only the user who owns the position can modify it")]
+    OnlyPositionOwnerAllowed,
+    
+    #[msg("Pool attempted to access user funds without authorization")]
+    UnauthorizedFundAccess,
+    
+    #[msg("Admin operations not supported in non-custodial mode")]
+    AdminOperationsNotSupported,
+    
+    #[msg("User must sign all transactions involving their funds")]
+    UserSignatureRequired,
 }

@@ -29,6 +29,15 @@ pub struct Pool {
     pub last_oracle_price: u64,          // Last recorded oracle price
     pub last_oracle_update: i64,         // Timestamp of last oracle update
     pub bump: u8,                        // PDA bump
+
+    /// Track individual user deposits in a PDA-based mapping
+    pub user_deposits_authority: Pubkey,
+    
+    /// Non-upgradable flag ensures protocol cannot be changed after deployment
+    pub immutable: bool,
+    
+    /// Flag to indicate this pool was initialized without admin keys
+    pub admin_less: bool,
 }
 
 impl Pool {
@@ -60,7 +69,10 @@ impl Pool {
         32 + // price_oracle
         8 + // last_oracle_price
         8 + // last_oracle_update
-        1   // bump
+         1 + // bump
+        32 + // user_deposits_authority
+        1 + // immutable
+        1   // admin_less
     }
 
     pub fn update_rates(&mut self, current_timestamp: i64) -> Result<()> {
@@ -227,5 +239,20 @@ impl Pool {
             .ok_or(ErrorCode::MathOverflow)? as u64;
             
         Ok(lending_rate)
+    }
+
+    /// Verify a transaction is authorized by the rightful owner
+    pub fn verify_owner_signed(&self, signer: &Signer) -> Result<()> {
+        require!(
+            self.user_deposits_authority == signer.key(),
+            OxygenError::Unauthorized
+        );
+        Ok(())
+    }
+    
+    /// Ensure pools can never be upgraded or changed by admins
+    pub fn verify_immutable(&self) -> Result<()> {
+        require!(self.immutable, OxygenError::PoolIsUpgradable);
+        Ok(())
     }
 }

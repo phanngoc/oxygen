@@ -1,0 +1,96 @@
+@startuml Deposit Flow
+
+' Define styling
+skinparam sequenceArrowColor #2c3e50
+skinparam sequenceParticipantBorderColor #2c3e50
+skinparam sequenceLifeLineBorderColor #2c3e50
+skinparam sequenceBoxBorderColor #ddd
+skinparam sequenceBoxBackgroundColor #f8f9fa
+
+' Title
+title Oxygen Protocol - Deposit Flow Sequence
+
+' Define participants
+actor "User" as User
+participant "User Wallet\n(Phantom/Solflare)" as Wallet
+participant "SDK Client" as SDK
+participant "Solana Blockchain" as Solana
+box "Oxygen Protocol" #f0f4f8
+    participant "Pool Module" as Pool
+    participant "Position Module" as Position
+    participant "Wallet Integration\nModule" as WalletIntegration
+end box
+participant "SPL Token Program" as SPLToken
+
+' Define the sequence
+User -> Wallet : Initiate deposit
+activate Wallet
+
+Wallet -> SDK : Request deposit(amount, useAsCollateral, enableLending)
+activate SDK
+
+SDK -> SDK : Create deposit instruction
+note right
+    Creates instruction with:
+    - Pool address
+    - User token account
+    - Asset reserve address
+    - User position account
+    - Amount
+    - Flags for collateral & lending
+end note
+
+SDK -> Wallet : Request transaction signature
+activate Wallet
+
+Wallet --> User : Sign transaction prompt
+User --> Wallet : Approve transaction
+deactivate Wallet
+
+SDK -> Solana : Submit signed transaction
+activate Solana
+
+Solana -> Pool : Process deposit instruction
+activate Pool
+
+Pool -> Pool : Verify immutable & admin-less flags
+note right: Ensures non-custodial operation
+
+Pool -> WalletIntegration : Validate user signature
+activate WalletIntegration
+WalletIntegration --> Pool : Signature verified
+deactivate WalletIntegration
+
+Pool -> Position : Find/Create user position
+activate Position
+
+Position -> Position : Add collateral entry
+Position --> Pool : Position updated
+deactivate Position
+
+Pool -> SPLToken : Transfer tokens from user to reserve
+activate SPLToken
+SPLToken --> Pool : Transfer complete
+deactivate SPLToken
+
+Pool -> Pool : Update pool statistics
+note left
+    - Increase total deposits
+    - If lending enabled,
+      update lending supply
+    - Update utilization rate
+end note
+
+Pool --> Solana : Return success
+deactivate Pool
+
+Solana --> SDK : Return transaction result
+deactivate Solana
+
+SDK --> Wallet : Display successful deposit
+deactivate SDK
+
+Wallet --> User : Deposit confirmation
+deactivate Wallet
+
+@enduml

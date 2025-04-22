@@ -1,0 +1,91 @@
+@startuml System Architecture
+
+' Define styling
+skinparam componentStyle uml2
+skinparam backgroundColor white
+skinparam componentArrowColor #2c3e50
+skinparam componentBorderColor #2c3e50
+skinparam noteBackgroundColor #f8f9fa
+skinparam noteBorderColor #ddd
+
+' Title
+title Oxygen Protocol - System Architecture
+
+' Define user layer
+package "User Layer" {
+  [User Wallet\n(Phantom/Solflare)] as UserWallet
+  [Web UI] as WebUI
+  [SDK Client] as SDKClient
+}
+
+' Define protocol layer
+package "Protocol Layer" {
+  [Solana Program] as Program {
+    package "Core Modules" {
+      [Pool Module] as PoolModule
+      [Position Module] as PositionModule
+      [Interest Module] as InterestModule
+      [Liquidation Module] as LiquidationModule
+      [Trading Module] as TradingModule
+      [Yield Generation Module] as YieldModule
+      [Wallet Integration Module] as WalletModule
+    }
+    
+    package "State Accounts" {
+      database "Pool Accounts" as PoolAccounts
+      database "Position Accounts" as PositionAccounts
+      database "Reserve Accounts" as ReserveAccounts
+    }
+  }
+}
+
+' Define integration layer
+package "External Integrations" {
+  [Serum DEX] as SerumDEX
+  [Pyth Oracle] as PythOracle
+  [SPL Token Program] as SPLToken
+}
+
+' Define relationships
+UserWallet --> WebUI : User Actions
+WebUI --> SDKClient : API Calls
+SDKClient --> Program : Instructions
+
+' Core module relationships
+PoolModule --> PoolAccounts : Manages
+PositionModule --> PositionAccounts : Manages
+InterestModule --> PoolAccounts : Updates rates
+LiquidationModule --> PositionAccounts : Monitors health
+TradingModule --> SerumDEX : Places orders
+WalletModule --> UserWallet : Verifies signatures
+
+' Integration relationships
+PoolModule --> SPLToken : Token transfers
+LiquidationModule --> PythOracle : Price feeds
+TradingModule --> PositionAccounts : Updates positions
+
+' State access
+PoolModule --> PositionAccounts : Checks positions
+PositionModule --> PoolAccounts : Checks pool data
+LiquidationModule --> PoolAccounts : Gets liquidation thresholds
+
+' Note about non-custodial design
+note right of WalletModule
+  All operations require
+  user signatures for
+  non-custodial security
+end note
+
+' Note about cross-collateralization
+note right of PositionModule
+  Cross-collateralization allows
+  using entire portfolio as collateral
+end note
+
+' Note about Serum DEX integration
+note bottom of SerumDEX
+  Provides order book functionality
+  for leveraged trading
+end note
+
+@enduml

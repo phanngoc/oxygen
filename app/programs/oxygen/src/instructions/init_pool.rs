@@ -18,11 +18,19 @@ pub struct InitializePoolParams {
     pub min_lending_duration: u64,   // Minimum duration for lending positions in seconds
     pub lending_fee: u64,            // Fee for lending out assets (in basis points)
     pub lending_interest_share: u64, // Percentage of interest that goes to lenders (basis points)
+    
+    /// Ensures the pool cannot be upgraded after deployment
+    pub immutable: bool,
+    
+    /// Set to true to make the pool completely admin-less
+    pub admin_less: bool,
 }
 
 #[derive(Accounts)]
 #[instruction(params: InitializePoolParams)]
 pub struct InitializePool<'info> {
+    /// This will be the user that initializes the pool
+    /// When admin_less is true, this is purely to pay for the transaction
     #[account(mut)]
     pub authority: Signer<'info>,
     
@@ -90,6 +98,18 @@ pub fn handler(ctx: Context<InitializePool>, params: InitializePoolParams) -> Re
         OxygenError::InvalidParameter
     );
     
+    // Enforce immutability if requested - this makes the pool non-upgradeable
+    require!(
+        params.immutable,
+        OxygenError::PoolMustBeImmutable
+    );
+
+    // Enforce admin-less operation - no special admin privileges
+    require!(
+        params.admin_less,
+        OxygenError::PoolMustBeAdminLess
+    );
+    
     let pool = &mut ctx.accounts.pool;
     let clock = Clock::get()?;
     
@@ -119,11 +139,17 @@ pub fn handler(ctx: Context<InitializePool>, params: InitializePoolParams) -> Re
     pool.lending_interest_share = params.lending_interest_share;
     pool.total_lent = 0; // Initialize total amount being lent out
     
+    // Initialize ownership and immutability settings
+    pool.user_deposits_authority = ctx.accounts.authority.key();
+    pool.immutable = params.immutable;
+    pool.admin_less = params.admin_less;
+    
     pool.bump = *ctx.bumps.get("pool").unwrap();
     
-    msg!("Initialized lending pool for {} with lending {}", 
-        pool.asset_mint, 
-        if params.lending_enabled { "enabled" } else { "disabled" });
+    msg!("Initialized non-custodial lending pool for {} with immutable={}, admin_less={}", 
+        pool.asset_mint,
+        params.immutable,
+        params.admin_less);
     
     Ok(())
 }

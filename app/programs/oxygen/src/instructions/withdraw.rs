@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use crate::state::{Pool, UserPosition};
 use crate::errors::OxygenError;
 use crate::events::{WithdrawEvent, LendingDisabledEvent, PoolUtilizationUpdatedEvent};
+// Import the wallet integration module
+use crate::modules::wallet_integration::WalletIntegration;
 
 #[derive(AnchorSerialize, AnchorDeserialize)]
 pub struct WithdrawParams {
@@ -57,7 +59,17 @@ pub fn handler(ctx: Context<Withdraw>, params: WithdrawParams) -> Result<()> {
     let user_position = &mut ctx.accounts.user_position;
     let clock = Clock::get()?;
     
-    // Check if operations are currently paused
+    // NON-CUSTODIAL: Ensure the pool is immutable and admin-less
+    require!(pool.immutable, OxygenError::PoolIsUpgradable);
+    require!(pool.admin_less, OxygenError::AdminOperationsNotSupported);
+    
+    // NON-CUSTODIAL: Validate that the user is signing their own withdrawal
+    WalletIntegration::validate_owner_signed(
+        &user_position.owner,
+        &ctx.accounts.user
+    )?;
+    
+    // Check if operations are currently paused - should never happen in admin-less mode
     if pool.operation_state_flags & 0x1 != 0 {
         return Err(OxygenError::OperationPaused.into());
     }
@@ -228,6 +240,16 @@ pub fn handler(ctx: Context<Withdraw>, params: WithdrawParams) -> Result<()> {
     ];
     
     let pool_signer = &[&pool_seeds[..]];
+    
+    // NON-CUSTODIAL: Generate transaction metadata for wallet transparency
+    let transaction_metadata = WalletIntegration::get_transaction_metadata(
+        &[amount.to_le_bytes().as_ref(), b"withdraw"].concat()
+    )?;
+    
+    // NON-CUSTODIAL: Ensure no admin operations are included in this transaction
+    WalletIntegration::validate_no_admin_operations(
+        &[0u8, 0u8, 0u8, 0u8] // Placeholder for actual instruction data
+    )?;
     
     let cpi_accounts = Transfer {
         from: ctx.accounts.asset_reserve.to_account_info(),

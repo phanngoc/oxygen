@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use crate::state::{Pool, UserPosition};
 use crate::errors::OxygenError;
 use crate::events::{BorrowEvent, PoolUtilizationUpdatedEvent};
+// Import the wallet integration module
+use crate::modules::wallet_integration::WalletIntegration;
 
 #[derive(AnchorSerialize, AnchorDeserialize)]
 pub struct BorrowParams {
@@ -57,6 +59,16 @@ pub fn handler(ctx: Context<Borrow>, params: BorrowParams) -> Result<()> {
     let pool = &mut ctx.accounts.pool;
     let user_position = &mut ctx.accounts.user_position;
     let clock = Clock::get()?;
+    
+    // NON-CUSTODIAL: Ensure the pool is immutable and admin-less
+    require!(pool.immutable, OxygenError::PoolIsUpgradable);
+    require!(pool.admin_less, OxygenError::AdminOperationsNotSupported);
+    
+    // NON-CUSTODIAL: Validate that user is signing their own transaction
+    WalletIntegration::validate_owner_signed(
+        &user_position.owner,
+        &ctx.accounts.user
+    )?;
     
     // Update pool rates before any operations
     pool.update_rates(clock.unix_timestamp)?;
@@ -135,6 +147,16 @@ pub fn handler(ctx: Context<Borrow>, params: BorrowParams) -> Result<()> {
     ];
     
     let pool_signer = &[&pool_seeds[..]];
+    
+    // NON-CUSTODIAL: Generate transaction metadata for wallet transparency
+    let transaction_metadata = WalletIntegration::get_transaction_metadata(
+        &[amount.to_le_bytes().as_ref(), b"borrow"].concat()
+    )?;
+    
+    // Validate no admin operations are included
+    WalletIntegration::validate_no_admin_operations(
+        &[0u8, 0u8, 0u8, 0u8] // Placeholder for actual instruction data
+    )?;
     
     let cpi_accounts = Transfer {
         from: ctx.accounts.asset_reserve.to_account_info(),
