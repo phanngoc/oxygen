@@ -6,6 +6,7 @@ pub mod modules;
 pub mod errors;
 
 use instructions::*;
+use std::collections::HashMap;
 
 declare_id!("Oxygen111111111111111111111111111111111111111");
 
@@ -38,9 +39,29 @@ pub mod oxygen {
         instructions::repay::handler(ctx, params)
     }
 
-    /// Place a leveraged trade using Serum DEX
-    pub fn trade_with_leverage(ctx: Context<TradeWithLeverage>, params: TradeParams) -> Result<()> {
-        instructions::trade::handler(ctx, params)
+    /// Open a leveraged trade position using Serum DEX
+    pub fn open_trade(ctx: Context<TradeWithLeverage>, params: TradeParams) -> Result<()> {
+        instructions::trade::open_trade(ctx, params)
+    }
+    
+    /// Close an existing leveraged trade position
+    pub fn close_trade(ctx: Context<CloseTradePosition>, params: ClosePositionParams) -> Result<()> {
+        instructions::trade::close_position(ctx, params)
+    }
+    
+    /// Monitor and liquidate positions if necessary
+    pub fn monitor_positions(ctx: Context<CloseTradePosition>, current_prices: HashMap<Pubkey, u64>) -> Result<()> {
+        instructions::trade::monitor_positions_for_liquidation(ctx, current_prices)
+    }
+    
+    /// Process funding rates for open leveraged positions
+    pub fn process_funding(ctx: Context<CloseTradePosition>, funding_rates: HashMap<Pubkey, i64>) -> Result<()> {
+        instructions::trade::process_funding_rates(ctx, funding_rates)
+    }
+    
+    /// Get user's open leveraged positions
+    pub fn get_open_positions(ctx: Context<CloseTradePosition>) -> Result<Vec<u64>> {
+        instructions::trade::get_open_positions(ctx)
     }
 
     /// Liquidate an undercollateralized position

@@ -1,30 +1,66 @@
 use anchor_lang::prelude::*;
 use std::collections::HashMap;
 
+/// User position in the protocol
 #[account]
+#[derive(Default)]
 pub struct UserPosition {
     pub owner: Pubkey,                              // User wallet
     pub collaterals: Vec<CollateralPosition>,       // User collaterals
     pub borrows: Vec<BorrowPosition>,               // User borrows
+    pub leveraged_positions: Vec<LeveragedPosition>, // User's leveraged trading positions
     pub health_factor: u64,                         // Current health factor
     pub last_updated: i64,                          // Last update timestamp
     pub bump: u8,                                   // PDA bump
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
-pub struct CollateralPosition {
-    pub pool: Pubkey,                               // Pool address
-    pub amount_deposited: u64,                      // Deposited amount
-    pub amount_scaled: u128,                        // Scaled amount (for yield)
-    pub is_collateral: bool,                        // Used as collateral
+/// Status of a leveraged position
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq)]
+pub enum PositionStatus {
+    Open,       // Position is open
+    Closed,     // Position was closed by the user
+    Liquidated, // Position was liquidated due to insufficient margin
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+impl Default for PositionStatus {
+    fn default() -> Self {
+        PositionStatus::Open
+    }
+}
+
+/// Leveraged trading position
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Default)]
+pub struct LeveragedPosition {
+    pub id: u64,                     // Unique position identifier
+    pub market: Pubkey,              // Market address (Serum DEX market)
+    pub side: crate::instructions::OrderSide, // Buy or sell side
+    pub size: u64,                   // Position size
+    pub entry_price: u64,            // Entry price
+    pub leverage: u64,               // Leverage used (in basis points, 10000 = 1x)
+    pub margin_used: u64,            // Margin used for this position
+    pub position_value: u64,         // Total value of the position
+    pub liquidation_price: u64,      // Price at which position will be liquidated
+    pub timestamp: i64,              // Time when position was opened
+    pub status: PositionStatus,      // Current status of the position
+    pub client_id: u64,              // Client order ID for identification
+}
+
+/// Collateral position
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Default)]
+pub struct CollateralPosition {
+    pub pool: Pubkey,                // Pool address
+    pub amount_deposited: u64,       // Deposited amount
+    pub amount_scaled: u128,         // Scaled amount (for yield)
+    pub is_collateral: bool,         // Used as collateral
+}
+
+/// Borrow position
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Default)]
 pub struct BorrowPosition {
-    pub pool: Pubkey,                               // Pool address
-    pub amount_borrowed: u64,                       // Borrowed amount
-    pub amount_scaled: u128,                        // Scaled amount (for interest)
-    pub interest_rate: u64,                         // Interest rate at time of borrow
+    pub pool: Pubkey,                // Pool address
+    pub amount_borrowed: u64,        // Borrowed amount
+    pub amount_scaled: u128,         // Scaled amount (for interest)
+    pub interest_rate: u64,          // Interest rate at time of borrow
 }
 
 impl UserPosition {
@@ -138,6 +174,23 @@ impl UserPosition {
                     .checked_add(value)
                     .ok_or(ErrorCode::MathOverflow)?;
             }
+        }
+        
+        // Include leveraged positions in the risk calculation
+        for position in &self.leveraged_positions {
+            // Only consider open positions
+            if position.status != PositionStatus::Open {
+                continue;
+            }
+            
+            // A leveraged position adds risk proportional to the leveraged value minus margin
+            let leveraged_risk = (position.position_value as u128)
+                .checked_sub(position.margin_used as u128)
+                .ok_or(ErrorCode::MathOverflow)?;
+                
+            total_borrowed_value = total_borrowed_value
+                .checked_add(leveraged_risk)
+                .ok_or(ErrorCode::MathOverflow)?;
         }
         
         // Calculate health factor

@@ -40,4 +40,34 @@ pub enum OxygenError {
     
     #[msg("Invalid parameter")]
     InvalidParameter,
+    
+    #[msg("Collateral position not found")]
+    CollateralNotFound,
+    
+    #[msg("Borrow position not found")]
+    BorrowNotFound,
+    
+    #[msg("Leveraged position not found")]
+    PositionNotFound,
+    
+    #[msg("Position is already closed")]
+    PositionAlreadyClosed,
+    
+    #[msg("Position is not eligible for liquidation")]
+    PositionNotLiquidatable,
+    
+    #[msg("Maximum number of leveraged positions reached")]
+    MaxPositionsReached,
+    
+    #[msg("Serum DEX error")]
+    SerumDexError,
+    
+    #[msg("Order placement failed")]
+    OrderPlacementFailed,
+    
+    #[msg("Price slippage exceeded limit")]
+    PriceSlippageExceeded,
+    
+    #[msg("Max leverage for market exceeded")]
+    MaxLeverageExceeded,
 }
