@@ -1,0 +1,26 @@
+[package]
+name = "oxygen-protocol"
+version = "0.1.0"
+description = "DeFi prime brokerage service built on Solana with Serum DEX integration"
+edition = "2021"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "oxygen_protocol"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+
+[dependencies]
+anchor-lang = "0.27.0"
+anchor-spl = "0.27.0"
+solana-program = "1.14.16"
+bytemuck = { version = "1.13.0", features = ["derive"] }
+
+# In a complete implementation, you'd include the Serum DEX crate:
+# serum_dex = { git = "https://github.com/project-serum/serum-dex", rev = "master", features = ["no-entrypoint"] }
